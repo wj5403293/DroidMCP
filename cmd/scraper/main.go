@@ -1,36 +1,23 @@
 // Command scraper provides an MCP server for lightweight web scraping.
-// It uses Colly for crawling and GoQuery for DOM traversal.
+// All requests go through an SSRF-safe HTTP client (security.go) and an
+// optional in-memory LRU (cache.go). Handlers parse arguments, call fetch(),
+// and run the response through goquery for the structured tools.
 package main
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
-	"github.com/gocolly/colly/v2"
 	"github.com/kahz12/droidmcp/internal/config"
 	"github.com/kahz12/droidmcp/internal/core"
 	"github.com/kahz12/droidmcp/internal/logger"
 	"github.com/mark3labs/mcp-go/mcp"
 )
-
-// Resource limits for outbound scrapes. Prevent a slow or unbounded server
-// from hanging a goroutine forever or filling memory with a huge response.
-const (
-	scraperRequestTimeout = 20 * time.Second
-	scraperMaxBodyBytes   = 10 * 1024 * 1024 // 10 MiB
-)
-
-// newCollector returns a colly collector with the project-wide timeout and
-// body-size limits applied.
-func newCollector() *colly.Collector {
-	c := colly.NewCollector(colly.MaxBodySize(scraperMaxBodyBytes))
-	c.SetRequestTimeout(scraperRequestTimeout)
-	return c
-}
 
 var cfg *config.Config
 
@@ -51,172 +38,426 @@ func main() {
 }
 
 func registerTools(s *core.DroidServer) {
-	// fetch_page: Returns raw HTML. Useful for LLMs to do their own parsing.
-	fetchPageTool := mcp.NewTool("fetch_page",
-		mcp.WithDescription("Fetch the HTML content of a URL"),
-		mcp.WithString("url", mcp.Required(), mcp.Description("URL to fetch")),
-	)
-	s.MCPServer.AddTool(fetchPageTool, handleFetchPage)
+	// Common option set: headers, user_agent, timeout_seconds, no_cache.
+	commonOpts := []mcp.ToolOption{
+		mcp.WithObject("headers", mcp.Description("Optional map of request header name -> value")),
+		mcp.WithString("user_agent", mcp.Description("Override the User-Agent header for this request")),
+		mcp.WithNumber("timeout_seconds", mcp.Description("Per-request timeout. Default 20 seconds, max 60.")),
+		mcp.WithBoolean("no_cache", mcp.Description("If true, bypass the in-memory response cache for this call")),
+		mcp.WithString("wait_selector", mcp.Description("Retry until this CSS selector matches (server-rendered + lazy data)")),
+		mcp.WithNumber("wait_attempts", mcp.Description("Maximum retries when wait_selector is set. Default 3, max 10.")),
+		mcp.WithNumber("wait_interval_ms", mcp.Description("Delay between retries when wait_selector is set. Default 1000ms.")),
+	}
 
-	// extract_text: Returns cleaned, human-readable text. Strips script/style tags.
-	extractTextTool := mcp.NewTool("extract_text",
-		mcp.WithDescription("Extract clean text from a URL"),
-		mcp.WithString("url", mcp.Required(), mcp.Description("URL to extract from")),
-	)
-	s.MCPServer.AddTool(extractTextTool, handleExtractText)
+	addTool := func(t mcp.Tool, h func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error)) {
+		s.MCPServer.AddTool(t, h)
+	}
 
-	// extract_links: Returns all absolute URLs found in 'a' tags.
-	extractLinksTool := mcp.NewTool("extract_links",
-		mcp.WithDescription("Extract all links from a URL"),
-		mcp.WithString("url", mcp.Required(), mcp.Description("URL to extract from")),
-	)
-	s.MCPServer.AddTool(extractLinksTool, handleExtractLinks)
+	addTool(mcp.NewTool("fetch_page",
+		append([]mcp.ToolOption{
+			mcp.WithDescription("Fetch the HTML content of a URL. Returns JSON with status, headers, and body."),
+			mcp.WithString("url", mcp.Required(), mcp.Description("URL to fetch (http or https only)")),
+		}, commonOpts...)...,
+	), handleFetchPage)
 
-	// extract_table: Converts HTML tables to a structured JSON format.
-	extractTableTool := mcp.NewTool("extract_table",
-		mcp.WithDescription("Extract HTML tables from a URL as JSON"),
-		mcp.WithString("url", mcp.Required(), mcp.Description("URL to extract from")),
-		mcp.WithString("selector", mcp.Description("Optional CSS selector for the table. Default: table")),
-	)
-	s.MCPServer.AddTool(extractTableTool, handleExtractTable)
+	addTool(mcp.NewTool("extract_text",
+		append([]mcp.ToolOption{
+			mcp.WithDescription("Extract clean text from a URL. Optional CSS selector limits the extraction to a region."),
+			mcp.WithString("url", mcp.Required(), mcp.Description("URL to extract from")),
+			mcp.WithString("selector", mcp.Description("Optional CSS selector. Default: extract from <body>")),
+		}, commonOpts...)...,
+	), handleExtractText)
+
+	addTool(mcp.NewTool("extract_links",
+		append([]mcp.ToolOption{
+			mcp.WithDescription("Extract all links from a URL. Returns absolute URLs with anchor text and rel."),
+			mcp.WithString("url", mcp.Required(), mcp.Description("URL to extract from")),
+			mcp.WithString("selector", mcp.Description("Optional CSS selector to limit the search. Default: a[href]")),
+		}, commonOpts...)...,
+	), handleExtractLinks)
+
+	addTool(mcp.NewTool("extract_table",
+		append([]mcp.ToolOption{
+			mcp.WithDescription("Extract HTML tables from a URL as structured JSON."),
+			mcp.WithString("url", mcp.Required(), mcp.Description("URL to extract from")),
+			mcp.WithString("selector", mcp.Description("Optional CSS selector for the table. Default: table")),
+		}, commonOpts...)...,
+	), handleExtractTable)
+
+	addTool(mcp.NewTool("extract_metadata",
+		append([]mcp.ToolOption{
+			mcp.WithDescription("Extract page metadata: title, description, canonical, og:*, twitter:*."),
+			mcp.WithString("url", mcp.Required(), mcp.Description("URL to extract from")),
+		}, commonOpts...)...,
+	), handleExtractMetadata)
+}
+
+// fetchResultJSON is the wire format for fetch_page (and the source of the
+// _meta block that the structured tools embed).
+type fetchResultJSON struct {
+	URL        string            `json:"url"`
+	Status     int               `json:"status"`
+	Headers    map[string]string `json:"headers,omitempty"`
+	Body       string            `json:"body"`
+	BodyBytes  int               `json:"body_bytes"`
+	FetchedAt  time.Time         `json:"fetched_at"`
+	FromCache  bool              `json:"from_cache"`
+}
+
+type linksResult struct {
+	URL       string     `json:"url"`
+	Status    int        `json:"status"`
+	Count     int        `json:"count"`
+	Items     []linkItem `json:"items"`
+	FromCache bool       `json:"from_cache"`
+}
+
+type linkItem struct {
+	Href  string `json:"href"`
+	Text  string `json:"text,omitempty"`
+	Rel   string `json:"rel,omitempty"`
+	Title string `json:"title,omitempty"`
+}
+
+type textResult struct {
+	URL       string `json:"url"`
+	Status    int    `json:"status"`
+	Selector  string `json:"selector,omitempty"`
+	Text      string `json:"text"`
+	FromCache bool   `json:"from_cache"`
+}
+
+type tableResult struct {
+	URL       string                `json:"url"`
+	Status    int                   `json:"status"`
+	Count     int                   `json:"count"`
+	Tables    [][]map[string]string `json:"tables"`
+	FromCache bool                  `json:"from_cache"`
+}
+
+type metadataResult struct {
+	URL         string            `json:"url"`
+	Status      int               `json:"status"`
+	Title       string            `json:"title,omitempty"`
+	Description string            `json:"description,omitempty"`
+	Canonical   string            `json:"canonical,omitempty"`
+	OpenGraph   map[string]string `json:"open_graph,omitempty"`
+	Twitter     map[string]string `json:"twitter,omitempty"`
+	FromCache   bool              `json:"from_cache"`
 }
 
 func handleFetchPage(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	url, err := req.RequireString("url")
+	opts, err := parseFetchOptions(req)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	c := newCollector()
-	var html string
-
-	c.OnResponse(func(r *colly.Response) {
-		html = string(r.Body)
+	resp, err := fetch(ctx, opts)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return jsonResult(fetchResultJSON{
+		URL:       resp.URL,
+		Status:    resp.Status,
+		Headers:   flattenHeaders(resp.Header),
+		Body:      string(resp.Body),
+		BodyBytes: len(resp.Body),
+		FetchedAt: resp.FetchedAt,
+		FromCache: resp.FromCache,
 	})
-
-	err = c.Visit(url)
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-
-	return mcp.NewToolResultText(html), nil
 }
 
 func handleExtractText(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	url, err := req.RequireString("url")
+	opts, err := parseFetchOptions(req)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	c := newCollector()
+	selector := strings.TrimSpace(req.GetString("selector", ""))
+	resp, err := fetch(ctx, opts)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	doc, derr := goquery.NewDocumentFromReader(strings.NewReader(string(resp.Body)))
+	if derr != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to parse HTML: %v", derr)), nil
+	}
+	doc.Find("script, style, iframe, noscript").Remove()
+
 	var text string
-
-	c.OnResponse(func(r *colly.Response) {
-		doc, derr := goquery.NewDocumentFromReader(strings.NewReader(string(r.Body)))
-		if derr == nil {
-			// DOM manipulation to remove noise before extracting text.
-			doc.Find("script, style, iframe, noscript").Remove()
+	if selector == "" {
+		text = strings.TrimSpace(doc.Find("body").Text())
+		if text == "" {
+			// Pages without an explicit <body> still have a Text() value at root.
 			text = strings.TrimSpace(doc.Text())
-			// Collapse multiple spaces/newlines for cleaner LLM input.
-			text = strings.Join(strings.Fields(text), " ")
 		}
-	})
-
-	err = c.Visit(url)
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+	} else {
+		sel := doc.Find(selector)
+		if sel.Length() == 0 {
+			return mcp.NewToolResultError(fmt.Sprintf("selector %q matched nothing", selector)), nil
+		}
+		text = strings.TrimSpace(sel.Text())
 	}
+	text = strings.Join(strings.Fields(text), " ")
 
-	return mcp.NewToolResultText(text), nil
+	return jsonResult(textResult{
+		URL:       resp.URL,
+		Status:    resp.Status,
+		Selector:  selector,
+		Text:      text,
+		FromCache: resp.FromCache,
+	})
 }
 
 func handleExtractLinks(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	url, err := req.RequireString("url")
+	opts, err := parseFetchOptions(req)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	c := newCollector()
-	var links []string
+	selector := req.GetString("selector", "a[href]")
+	resp, err := fetch(ctx, opts)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	doc, derr := goquery.NewDocumentFromReader(strings.NewReader(string(resp.Body)))
+	if derr != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to parse HTML: %v", derr)), nil
+	}
 
-	c.OnHTML("a[href]", func(e *colly.HTMLElement) {
-		// e.Request.AbsoluteURL ensures we get the full URL even for relative links.
-		links = append(links, e.Request.AbsoluteURL(e.Attr("href")))
+	var items []linkItem
+	doc.Find(selector).Each(func(_ int, s *goquery.Selection) {
+		href, ok := s.Attr("href")
+		if !ok || strings.TrimSpace(href) == "" {
+			return
+		}
+		abs := absoluteURL(resp.URL, href)
+		items = append(items, linkItem{
+			Href:  abs,
+			Text:  strings.TrimSpace(s.Text()),
+			Rel:   s.AttrOr("rel", ""),
+			Title: s.AttrOr("title", ""),
+		})
 	})
 
-	err = c.Visit(url)
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-
-	return mcp.NewToolResultText(strings.Join(links, "\n")), nil
+	return jsonResult(linksResult{
+		URL:       resp.URL,
+		Status:    resp.Status,
+		Count:     len(items),
+		Items:     items,
+		FromCache: resp.FromCache,
+	})
 }
 
 func handleExtractTable(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	url, err := req.RequireString("url")
+	opts, err := parseFetchOptions(req)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	selector := req.GetString("selector", "table")
-	c := newCollector()
-	var tables [][]map[string]string
-
-	c.OnResponse(func(r *colly.Response) {
-		doc, derr := goquery.NewDocumentFromReader(strings.NewReader(string(r.Body)))
-		if derr != nil {
-			return
-		}
-
-		doc.Find(selector).Each(func(i int, tableHtml *goquery.Selection) {
-			var table []map[string]string
-			var headers []string
-
-			// Prefer headers declared in <thead> (first thead row). Fallback to
-			// first <tr> further below if thead is absent.
-			tableHtml.Find("thead tr").First().Find("th, td").Each(func(_ int, cellHtml *goquery.Selection) {
-				headers = append(headers, strings.TrimSpace(cellHtml.Text()))
-			})
-			hadThead := len(headers) > 0
-
-			// Pick the row source: tbody tr if present, otherwise top-level tr.
-			// When thead supplied headers, exclude any tr nested inside thead so
-			// they are not counted as data rows.
-			rows := tableHtml.Find("tbody tr")
-			if rows.Length() == 0 {
-				rows = tableHtml.Find("tr")
-				if hadThead {
-					rows = rows.NotSelection(tableHtml.Find("thead tr"))
-				}
-			}
-
-			rows.Each(func(j int, rowHtml *goquery.Selection) {
-				// Legacy fallback: no thead at all, treat the first row as header.
-				if !hadThead && j == 0 {
-					rowHtml.Find("th, td").Each(func(k int, cellHtml *goquery.Selection) {
-						headers = append(headers, strings.TrimSpace(cellHtml.Text()))
-					})
-					return
-				}
-				rowData := make(map[string]string)
-				rowHtml.Find("td").Each(func(k int, cellHtml *goquery.Selection) {
-					header := fmt.Sprintf("col%d", k)
-					if k < len(headers) {
-						header = headers[k]
-					}
-					rowData[header] = strings.TrimSpace(cellHtml.Text())
-				})
-				if len(rowData) > 0 {
-					table = append(table, rowData)
-				}
-			})
-			if len(table) > 0 {
-				tables = append(tables, table)
-			}
-		})
-	})
-
-	err = c.Visit(url)
+	resp, err := fetch(ctx, opts)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	doc, derr := goquery.NewDocumentFromReader(strings.NewReader(string(resp.Body)))
+	if derr != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to parse HTML: %v", derr)), nil
+	}
 
-	jsonData, _ := json.MarshalIndent(tables, "", "  ")
-	return mcp.NewToolResultText(string(jsonData)), nil
+	var tables [][]map[string]string
+	doc.Find(selector).Each(func(i int, tableHtml *goquery.Selection) {
+		var table []map[string]string
+		var headers []string
+
+		tableHtml.Find("thead tr").First().Find("th, td").Each(func(_ int, cellHtml *goquery.Selection) {
+			headers = append(headers, strings.TrimSpace(cellHtml.Text()))
+		})
+		hadThead := len(headers) > 0
+
+		rows := tableHtml.Find("tbody tr")
+		if rows.Length() == 0 {
+			rows = tableHtml.Find("tr")
+			if hadThead {
+				rows = rows.NotSelection(tableHtml.Find("thead tr"))
+			}
+		}
+
+		rows.Each(func(j int, rowHtml *goquery.Selection) {
+			if !hadThead && j == 0 {
+				rowHtml.Find("th, td").Each(func(_ int, cellHtml *goquery.Selection) {
+					headers = append(headers, strings.TrimSpace(cellHtml.Text()))
+				})
+				return
+			}
+			rowData := make(map[string]string)
+			rowHtml.Find("td").Each(func(k int, cellHtml *goquery.Selection) {
+				header := fmt.Sprintf("col%d", k)
+				if k < len(headers) {
+					header = headers[k]
+				}
+				rowData[header] = strings.TrimSpace(cellHtml.Text())
+			})
+			if len(rowData) > 0 {
+				table = append(table, rowData)
+			}
+		})
+		if len(table) > 0 {
+			tables = append(tables, table)
+		}
+	})
+
+	return jsonResult(tableResult{
+		URL:       resp.URL,
+		Status:    resp.Status,
+		Count:     len(tables),
+		Tables:    tables,
+		FromCache: resp.FromCache,
+	})
+}
+
+func handleExtractMetadata(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	opts, err := parseFetchOptions(req)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	resp, err := fetch(ctx, opts)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	doc, derr := goquery.NewDocumentFromReader(strings.NewReader(string(resp.Body)))
+	if derr != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to parse HTML: %v", derr)), nil
+	}
+
+	out := metadataResult{
+		URL:       resp.URL,
+		Status:    resp.Status,
+		Title:     strings.TrimSpace(doc.Find("title").First().Text()),
+		FromCache: resp.FromCache,
+	}
+	if v, ok := doc.Find(`meta[name="description"]`).Attr("content"); ok {
+		out.Description = strings.TrimSpace(v)
+	}
+	if v, ok := doc.Find(`link[rel="canonical"]`).Attr("href"); ok {
+		out.Canonical = absoluteURL(resp.URL, strings.TrimSpace(v))
+	}
+
+	og := map[string]string{}
+	doc.Find(`meta[property]`).Each(func(_ int, s *goquery.Selection) {
+		prop, _ := s.Attr("property")
+		prop = strings.ToLower(strings.TrimSpace(prop))
+		if !strings.HasPrefix(prop, "og:") {
+			return
+		}
+		content, _ := s.Attr("content")
+		og[strings.TrimPrefix(prop, "og:")] = strings.TrimSpace(content)
+	})
+	if len(og) > 0 {
+		out.OpenGraph = og
+	}
+
+	tw := map[string]string{}
+	doc.Find(`meta[name]`).Each(func(_ int, s *goquery.Selection) {
+		name, _ := s.Attr("name")
+		name = strings.ToLower(strings.TrimSpace(name))
+		if !strings.HasPrefix(name, "twitter:") {
+			return
+		}
+		content, _ := s.Attr("content")
+		tw[strings.TrimPrefix(name, "twitter:")] = strings.TrimSpace(content)
+	})
+	if len(tw) > 0 {
+		out.Twitter = tw
+	}
+
+	return jsonResult(out)
+}
+
+// parseFetchOptions extracts the shared fetch knobs (headers, user_agent,
+// timeout, wait_selector, no_cache) from an MCP request and returns
+// fetchOptions ready to hand to fetch().
+func parseFetchOptions(req mcp.CallToolRequest) (fetchOptions, error) {
+	rawURL, err := req.RequireString("url")
+	if err != nil {
+		return fetchOptions{}, err
+	}
+	opts := fetchOptions{
+		URL:          rawURL,
+		UserAgent:    req.GetString("user_agent", ""),
+		Headers:      stringMapArg(req, "headers"),
+		NoCache:      req.GetBool("no_cache", false),
+		WaitSelector: req.GetString("wait_selector", ""),
+		WaitAttempts: req.GetInt("wait_attempts", 0),
+	}
+	if t := req.GetInt("timeout_seconds", 0); t > 0 {
+		if t > 60 {
+			t = 60
+		}
+		opts.Timeout = time.Duration(t) * time.Second
+	}
+	if ms := req.GetInt("wait_interval_ms", 0); ms > 0 {
+		opts.WaitInterval = time.Duration(ms) * time.Millisecond
+	}
+	return opts, nil
+}
+
+// stringMapArg pulls a string->string map out of a JSON-decoded object arg,
+// dropping non-string values silently. This is what mcp-go gives us for
+// WithObject; it does not have a typed getter.
+func stringMapArg(req mcp.CallToolRequest, name string) map[string]string {
+	args := req.GetArguments()
+	v, ok := args[name]
+	if !ok || v == nil {
+		return nil
+	}
+	raw, ok := v.(map[string]any)
+	if !ok || len(raw) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(raw))
+	for k, val := range raw {
+		if s, ok := val.(string); ok {
+			out[k] = s
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// flattenHeaders converts an http.Header (multi-value) to the simpler
+// string->string map our JSON contract uses. Only the first value per key is
+// kept; this matches what most callers need and keeps the payload small.
+func flattenHeaders(h map[string][]string) map[string]string {
+	if len(h) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(h))
+	for k, v := range h {
+		if len(v) > 0 {
+			out[k] = v[0]
+		}
+	}
+	return out
+}
+
+// absoluteURL resolves a possibly-relative href against base. If anything goes
+// wrong (unparseable base or href) we return the raw href so the caller still
+// sees something useful.
+func absoluteURL(base, href string) string {
+	bu, err := url.Parse(base)
+	if err != nil {
+		return href
+	}
+	hu, err := url.Parse(href)
+	if err != nil {
+		return href
+	}
+	return bu.ResolveReference(hu).String()
+}
+
+func jsonResult(v any) (*mcp.CallToolResult, error) {
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to marshal response: %v", err)), nil
+	}
+	return mcp.NewToolResultText(string(b)), nil
 }
