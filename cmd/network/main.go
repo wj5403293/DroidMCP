@@ -1,11 +1,18 @@
 // Command network provides an MCP server for local network discovery.
-// It includes host discovery and port scanning using concurrent Go routines.
+// Every tool returns JSON. Targets are restricted to private ranges (RFC1918
+// + link-local + loopback + IPv6 ULA) by default; set
+// DROIDMCP_NETWORK_ALLOW_PUBLIC=1 to opt in to public targets (audit 2.10).
 package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"os/exec"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,180 +42,317 @@ func main() {
 }
 
 func registerTools(s *core.DroidServer) {
-	// scan_network: Uses TCP dial attempts to detect active hosts in a subnet.
-	scanNetTool := mcp.NewTool("scan_network",
-		mcp.WithDescription("Scan local network for active hosts"),
-		mcp.WithString("subnet", mcp.Description("Subnet to scan (e.g., 192.168.1.0/24). If empty, tries to detect local subnet")),
-	)
-	s.MCPServer.AddTool(scanNetTool, handleScanNetwork)
+	add := func(t mcp.Tool, h func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error)) {
+		s.MCPServer.AddTool(t, h)
+	}
 
-	// check_ports: Concurrent TCP port scanner for a single host.
-	checkPortsTool := mcp.NewTool("check_ports",
-		mcp.WithDescription("Scan common ports on a host"),
-		mcp.WithString("host", mcp.Required(), mcp.Description("Host to scan (IP or hostname)")),
-		mcp.WithString("ports", mcp.Description("Comma-separated list of ports. Default: common ports")),
-	)
-	s.MCPServer.AddTool(checkPortsTool, handleCheckPorts)
+	add(mcp.NewTool("scan_network",
+		mcp.WithDescription("Scan a private subnet for active hosts. Returns JSON with IP, MAC (from ARP) and open ports."),
+		mcp.WithString("subnet", mcp.Description("CIDR to scan (e.g. 192.168.1.0/24). If empty, the local subnet is auto-detected.")),
+		mcp.WithNumber("timeout_seconds", mcp.Description("Per-call timeout. Default 30s, max 120s.")),
+	), handleScanNetwork)
+
+	add(mcp.NewTool("check_ports",
+		mcp.WithDescription("Concurrent TCP port check on a single host. Returns JSON {host, resolved, ports: [{port, open}]}."),
+		mcp.WithString("host", mcp.Required(), mcp.Description("Host to check (IP or hostname)")),
+		mcp.WithString("ports", mcp.Description("Comma-separated list of ports. Default: common ports.")),
+		mcp.WithNumber("timeout_seconds", mcp.Description("Per-call timeout. Default 15s, max 60s.")),
+	), handleCheckPorts)
+
+	add(mcp.NewTool("nslookup",
+		mcp.WithDescription("Forward DNS lookup. Returns JSON {host, addrs}."),
+		mcp.WithString("host", mcp.Required(), mcp.Description("Hostname to resolve")),
+	), handleNSLookup)
+
+	add(mcp.NewTool("reverse_dns",
+		mcp.WithDescription("Reverse DNS lookup. Returns JSON {ip, names}."),
+		mcp.WithString("ip", mcp.Required(), mcp.Description("IP address to look up")),
+	), handleReverseDNS)
+
+	add(mcp.NewTool("traceroute",
+		mcp.WithDescription("Trace the path to a host. Shells out to traceroute or tracepath; root not required for the latter."),
+		mcp.WithString("host", mcp.Required(), mcp.Description("Target host")),
+		mcp.WithNumber("max_hops", mcp.Description("Max TTL hops to probe. Default 30.")),
+		mcp.WithNumber("timeout_seconds", mcp.Description("Per-call timeout. Default 30s, max 120s.")),
+	), handleTraceroute)
+
+	add(mcp.NewTool("network_info",
+		mcp.WithDescription("Local network metadata: default gateway, DNS servers, interfaces, detected subnet."),
+	), handleNetworkInfo)
+}
+
+// scanResult is the wire shape for scan_network.
+type scanResult struct {
+	Subnet  string        `json:"subnet"`
+	Count   int           `json:"count"`
+	Hosts   []scannedHost `json:"hosts"`
+	Capped  bool          `json:"capped,omitempty"`
+	Note    string        `json:"note,omitempty"`
 }
 
 func handleScanNetwork(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	subnet := req.GetString("subnet", "")
+	subnet := strings.TrimSpace(req.GetString("subnet", ""))
 	if subnet == "" {
 		subnet = getLocalSubnet()
 	}
-
 	if subnet == "" {
-		return mcp.NewToolResultError("Could not detect local subnet and none provided"), nil
+		return mcp.NewToolResultError("could not detect local subnet and none provided"), nil
+	}
+	ipnet, err := validateCIDR(subnet)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	logger.Info("Scanning subnet", "subnet", subnet)
-	hosts := scanSubnet(subnet)
+	timeout := durationFromReq(req, 30*time.Second, 120*time.Second)
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
-	return mcp.NewToolResultText(fmt.Sprintf("Active hosts in %s:\n%s", subnet, strings.Join(hosts, "\n"))), nil
+	hosts, scanErr := scanSubnet(cctx, ipnet)
+	res := scanResult{
+		Subnet: ipnet.String(),
+		Count:  len(hosts),
+		Hosts:  hosts,
+	}
+	if scanErr != nil {
+		// Cap-warning is informational; ctx errors are fatal.
+		if errors.Is(scanErr, context.DeadlineExceeded) || errors.Is(scanErr, context.Canceled) {
+			res.Note = scanErr.Error()
+		} else {
+			res.Capped = true
+			res.Note = scanErr.Error()
+		}
+	}
+	return jsonResult(res)
 }
+
+// portCheck is the per-port entry in checkPortsResult.
+type portCheck struct {
+	Port int  `json:"port"`
+	Open bool `json:"open"`
+}
+
+type checkPortsResult struct {
+	Host     string      `json:"host"`
+	Resolved []string    `json:"resolved,omitempty"`
+	Ports    []portCheck `json:"ports"`
+}
+
+const defaultCheckPorts = "21,22,23,25,53,80,110,135,139,143,443,445,993,995,1723,3306,3389,5900,8080"
 
 func handleCheckPorts(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	host, err := req.RequireString("host")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	portsStr := req.GetString("ports", "21,22,23,25,53,80,110,135,139,143,443,445,993,995,1723,3306,3389,5900,8080")
-	ports := strings.Split(portsStr, ",")
-
-	var wg sync.WaitGroup
-	var openPorts []string
-	var mu sync.Mutex
-
-	// We use a pool of goroutines to scan ports concurrently.
-	for _, port := range ports {
-		wg.Add(1)
-		go func(p string) {
-			defer wg.Done()
-			address := net.JoinHostPort(host, p)
-			// Small timeout for local network scanning to keep it fast.
-			conn, err := net.DialTimeout("tcp", address, 500*time.Millisecond)
-			if err == nil {
-				mu.Lock()
-				openPorts = append(openPorts, p)
-				mu.Unlock()
-				conn.Close()
-			}
-		}(strings.TrimSpace(port))
-	}
-	wg.Wait()
-
-	if len(openPorts) == 0 {
-		return mcp.NewToolResultText(fmt.Sprintf("No open ports found on %s", host)), nil
-	}
-
-	return mcp.NewToolResultText(fmt.Sprintf("Open ports on %s: %s", host, strings.Join(openPorts, ", "))), nil
-}
-
-// getLocalSubnet attempts to identify the current IPv4 subnet of the primary interface.
-// It returns the actual CIDR (network address + mask), not a hard-coded /24.
-func getLocalSubnet() string {
-	addrs, err := net.InterfaceAddrs()
+	resolved, err := validateTarget(host)
 	if err != nil {
-		return ""
+		return mcp.NewToolResultError(err.Error()), nil
 	}
-	for _, address := range addrs {
-		ipnet, ok := address.(*net.IPNet)
-		if !ok || ipnet.IP.IsLoopback() {
-			continue
-		}
-		ip4 := ipnet.IP.To4()
-		if ip4 == nil {
-			continue
-		}
-		ones, bits := ipnet.Mask.Size()
-		if bits != 32 {
-			// Skip non-IPv4 masks (e.g., a 4-in-6 IP without a clean v4 mask).
-			continue
-		}
-		network := ip4.Mask(ipnet.Mask)
-		return fmt.Sprintf("%s/%d", network.String(), ones)
-	}
-	return ""
-}
 
-// maxScanHosts caps the number of addresses scanSubnet expands a CIDR into so
-// that very wide subnets (e.g. /8, /16) cannot spawn millions of dials.
-const maxScanHosts = 4096
-
-// scanWorkerLimit bounds concurrent dials to keep file-descriptor and goroutine
-// pressure low on resource-constrained Android/Termux devices.
-const scanWorkerLimit = 128
-
-// scanSubnet performs a concurrent scan of all hosts inside the given CIDR. It
-// honors the supplied mask (no longer hard-coded /24), excludes the network and
-// broadcast addresses for masks that have them, and limits concurrency.
-// Note: This is a loud scan and may be blocked by some firewalls.
-func scanSubnet(subnet string) []string {
-	_, ipnet, err := net.ParseCIDR(subnet)
+	portsRaw := req.GetString("ports", defaultCheckPorts)
+	ports, err := parsePorts(portsRaw)
 	if err != nil {
-		return nil
-	}
-	ip4 := ipnet.IP.To4()
-	if ip4 == nil {
-		return nil // IPv4 only for now
-	}
-	ones, bits := ipnet.Mask.Size()
-	if bits != 32 {
-		return nil
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	hostBits := bits - ones
-	var totalAddresses uint64 = 1 << uint(hostBits)
-	if totalAddresses > maxScanHosts {
-		logger.Info("Subnet too large, capping scan", "cidr", subnet, "limit", maxScanHosts)
-		totalAddresses = maxScanHosts
-	}
+	timeout := durationFromReq(req, 15*time.Second, 60*time.Second)
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
-	networkInt := ipv4ToUint32(ip4.Mask(ipnet.Mask))
-	// For /31 and /32 every address is a host. For wider masks the first and
-	// last addresses are network/broadcast and are skipped.
-	var startOffset, endOffset uint64 = 0, totalAddresses
-	if hostBits >= 2 {
-		startOffset = 1
-		endOffset = totalAddresses - 1
+	type portResult struct {
+		Port int
+		Open bool
 	}
-
-	sem := make(chan struct{}, scanWorkerLimit)
+	results := make([]portResult, len(ports))
 	var wg sync.WaitGroup
-	var activeHosts []string
-	var mu sync.Mutex
-
-	portsToTry := []string{"80", "22", "443"}
-	for offset := startOffset; offset < endOffset; offset++ {
-		target := uint32ToIPv4(networkInt + uint32(offset)).String()
+	dialer := &net.Dialer{Timeout: 500 * time.Millisecond}
+	sem := make(chan struct{}, 64)
+	for i, p := range ports {
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(target string) {
+		go func(i, p int) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			// We try ports 80, 22 and 443 as heuristics for active hosts.
-			// In a real scenario, ICMP ping might be better, but it requires root in Termux.
-			for _, p := range portsToTry {
-				conn, err := net.DialTimeout("tcp", net.JoinHostPort(target, p), 150*time.Millisecond)
-				if err == nil {
-					mu.Lock()
-					activeHosts = append(activeHosts, target)
-					mu.Unlock()
-					conn.Close()
-					return
-				}
+			conn, err := dialer.DialContext(cctx, "tcp", net.JoinHostPort(host, strconv.Itoa(p)))
+			results[i] = portResult{Port: p, Open: err == nil}
+			if conn != nil {
+				conn.Close()
 			}
-		}(target)
+		}(i, p)
 	}
 	wg.Wait()
-	return activeHosts
+
+	out := checkPortsResult{Host: host, Ports: make([]portCheck, len(results))}
+	for _, ip := range resolved {
+		out.Resolved = append(out.Resolved, ip.String())
+	}
+	for i, r := range results {
+		out.Ports[i] = portCheck{Port: r.Port, Open: r.Open}
+	}
+	return jsonResult(out)
 }
 
-func ipv4ToUint32(ip net.IP) uint32 {
-	ip = ip.To4()
-	return uint32(ip[0])<<24 | uint32(ip[1])<<16 | uint32(ip[2])<<8 | uint32(ip[3])
+type nslookupResult struct {
+	Host  string   `json:"host"`
+	Addrs []string `json:"addrs"`
 }
 
-func uint32ToIPv4(n uint32) net.IP {
-	return net.IPv4(byte(n>>24), byte(n>>16), byte(n>>8), byte(n)).To4()
+func handleNSLookup(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	host, err := req.RequireString("host")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	resolver := &net.Resolver{}
+	ips, err := resolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("resolve %s: %v", host, err)), nil
+	}
+	out := nslookupResult{Host: host}
+	for _, ip := range ips {
+		out.Addrs = append(out.Addrs, ip.IP.String())
+	}
+	sort.Strings(out.Addrs)
+	return jsonResult(out)
+}
+
+type reverseDNSResult struct {
+	IP    string   `json:"ip"`
+	Names []string `json:"names"`
+}
+
+func handleReverseDNS(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	ipStr, err := req.RequireString("ip")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	ip := net.ParseIP(strings.TrimSpace(ipStr))
+	if ip == nil {
+		return mcp.NewToolResultError(fmt.Sprintf("invalid IP %q", ipStr)), nil
+	}
+	resolver := &net.Resolver{}
+	names, err := resolver.LookupAddr(ctx, ip.String())
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("reverse %s: %v", ip, err)), nil
+	}
+	for i, n := range names {
+		names[i] = strings.TrimSuffix(n, ".")
+	}
+	sort.Strings(names)
+	return jsonResult(reverseDNSResult{IP: ip.String(), Names: names})
+}
+
+type tracerouteResult struct {
+	Host string `json:"host"`
+	Tool string `json:"tool"`
+	Raw  string `json:"raw"`
+}
+
+// handleTraceroute shells out to the system `traceroute` (or `tracepath`)
+// because pure-Go TCP/UDP traceroute requires CAP_NET_RAW to read the ICMP
+// time-exceeded replies. tracepath does not need root and is usually the
+// best fit on Termux + Android.
+func handleTraceroute(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	host, err := req.RequireString("host")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if _, err := validateTarget(host); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	maxHops := req.GetInt("max_hops", 30)
+	if maxHops <= 0 || maxHops > 64 {
+		maxHops = 30
+	}
+	timeout := durationFromReq(req, 30*time.Second, 120*time.Second)
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	tool, args, err := chooseTracerouteTool(host, maxHops)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	cmd := exec.CommandContext(cctx, tool, args...)
+	out, runErr := cmd.CombinedOutput()
+	res := tracerouteResult{Host: host, Tool: tool, Raw: string(out)}
+	if runErr != nil {
+		// Surface stderr (already in CombinedOutput) plus the wrapper error.
+		res.Raw = strings.TrimSpace(res.Raw)
+		if res.Raw != "" {
+			res.Raw += "\n"
+		}
+		res.Raw += runErr.Error()
+		body, _ := json.Marshal(res)
+		return mcp.NewToolResultError(string(body)), nil
+	}
+	return jsonResult(res)
+}
+
+// chooseTracerouteTool prefers `tracepath` (no root) on Termux/Android,
+// falling back to `traceroute -n` otherwise. The audit asks for "no root";
+// we never invoke ICMP traceroute.
+func chooseTracerouteTool(host string, maxHops int) (string, []string, error) {
+	if path, err := exec.LookPath("tracepath"); err == nil {
+		return path, []string{"-n", "-m", strconv.Itoa(maxHops), host}, nil
+	}
+	if path, err := exec.LookPath("traceroute"); err == nil {
+		// -T attempts TCP traceroute; on hosts where it requires root the
+		// binary usually falls back to UDP without prompting. -n suppresses
+		// reverse DNS for speed.
+		return path, []string{"-n", "-m", strconv.Itoa(maxHops), host}, nil
+	}
+	return "", nil, errors.New("no tracepath or traceroute binary on PATH; install inetutils to enable this tool")
+}
+
+func handleNetworkInfo(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return jsonResult(gatherNetworkInfo())
+}
+
+// parsePorts turns a comma-separated list of port numbers into a sorted
+// dedup'd []int. Rejects values outside 1..65535.
+func parsePorts(raw string) ([]int, error) {
+	parts := strings.Split(raw, ",")
+	seen := make(map[int]struct{}, len(parts))
+	out := make([]int, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 1 || n > 65535 {
+			return nil, fmt.Errorf("invalid port %q", p)
+		}
+		if _, ok := seen[n]; ok {
+			continue
+		}
+		seen[n] = struct{}{}
+		out = append(out, n)
+	}
+	if len(out) == 0 {
+		return nil, errors.New("no ports specified")
+	}
+	sort.Ints(out)
+	return out, nil
+}
+
+// durationFromReq pulls timeout_seconds from the request and clamps to the
+// allowed range, defaulting to def when absent or non-positive.
+func durationFromReq(req mcp.CallToolRequest, def, max time.Duration) time.Duration {
+	t := req.GetInt("timeout_seconds", 0)
+	if t <= 0 {
+		return def
+	}
+	d := time.Duration(t) * time.Second
+	if d > max {
+		return max
+	}
+	return d
+}
+
+func jsonResult(v any) (*mcp.CallToolResult, error) {
+	body, err := json.Marshal(v)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return mcp.NewToolResultText(string(body)), nil
 }
