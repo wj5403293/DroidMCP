@@ -3,11 +3,15 @@
 package core
 
 import (
+	"bufio"
 	"context"
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -30,9 +34,21 @@ const (
 // server is configured with an API key.
 const authHeader = "X-DroidMCP-Key"
 
+// Env keys for optional TLS support. Both must be set to a readable cert/key
+// pair; otherwise the server falls back to plain HTTP on 127.0.0.1.
+const (
+	envTLSCert = "DROIDMCP_TLS_CERT"
+	envTLSKey  = "DROIDMCP_TLS_KEY"
+)
+
 // DroidServer wraps the MCP server to provide common transport initialization.
 type DroidServer struct {
 	MCPServer *server.MCPServer
+
+	// Name and Version identify the server in /healthz responses and log
+	// lines.
+	Name    string
+	Version string
 
 	// APIKey is the secret required in the X-DroidMCP-Key header for every
 	// inbound request. An empty value disables authentication (dev mode) and
@@ -45,19 +61,32 @@ func NewDroidServer(name, version string) *DroidServer {
 	s := server.NewMCPServer(name, version)
 	return &DroidServer{
 		MCPServer: s,
+		Name:      name,
+		Version:   version,
 	}
 }
 
 // ServeSSE starts the server using the SSE (Server-Sent Events) transport.
 // The listener is always bound to 127.0.0.1 so the server is unreachable from
 // external network interfaces. All routes (SSE and message endpoints) are
-// wrapped in the API key middleware.
+// wrapped in the API key middleware; /healthz is exposed unauthenticated for
+// supervisors. TLS is enabled when both DROIDMCP_TLS_CERT and DROIDMCP_TLS_KEY
+// are set.
 func (s *DroidServer) ServeSSE(port int) error {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	baseURL := fmt.Sprintf("http://%s", addr)
+
+	tlsCert := os.Getenv(envTLSCert)
+	tlsKey := os.Getenv(envTLSKey)
+	useTLS := tlsCert != "" && tlsKey != ""
+
+	scheme := "http"
+	if useTLS {
+		scheme = "https"
+	}
+	baseURL := fmt.Sprintf("%s://%s", scheme, addr)
 
 	sseServer := server.NewSSEServer(s.MCPServer, server.WithBaseURL(baseURL))
-	handler := authMiddleware(s.APIKey, sseServer)
+	handler := buildHandler(s, useTLS, sseServer)
 
 	httpSrv := &http.Server{
 		Addr:              addr,
@@ -68,10 +97,10 @@ func (s *DroidServer) ServeSSE(port int) error {
 
 	if s.APIKey == "" {
 		logger.Info("Starting MCP SSE Server (auth DISABLED — dev mode)",
-			"addr", addr, "url", baseURL+"/sse")
+			"addr", addr, "url", baseURL+"/sse", "tls", useTLS)
 	} else {
 		logger.Info("Starting MCP SSE Server",
-			"addr", addr, "url", baseURL+"/sse", "auth", "enabled")
+			"addr", addr, "url", baseURL+"/sse", "auth", "enabled", "tls", useTLS)
 	}
 
 	// Wait for SIGINT/SIGTERM in a separate goroutine and trigger a graceful
@@ -81,7 +110,11 @@ func (s *DroidServer) ServeSSE(port int) error {
 
 	serveErr := make(chan error, 1)
 	go func() {
-		serveErr <- httpSrv.ListenAndServe()
+		if useTLS {
+			serveErr <- httpSrv.ListenAndServeTLS(tlsCert, tlsKey)
+		} else {
+			serveErr <- httpSrv.ListenAndServe()
+		}
 	}()
 
 	select {
@@ -99,6 +132,47 @@ func (s *DroidServer) ServeSSE(port int) error {
 		}
 		return nil
 	}
+}
+
+// buildHandler composes the full middleware chain around the SSE handler. It
+// is exported (lowercase but in-package) for direct testing without binding a
+// network listener.
+func buildHandler(s *DroidServer, tlsEnabled bool, sseHandler http.Handler) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", s.handleHealthz)
+	mux.Handle("/", authMiddleware(s.APIKey, sseHandler))
+	return requestLogger(securityHeaders(tlsEnabled, mux))
+}
+
+// handleHealthz responds with a small JSON document identifying the server.
+// It is mounted *before* the auth middleware so external supervisors (systemd
+// watchdog, Docker healthcheck, etc.) can probe liveness without needing the
+// API key.
+func (s *DroidServer) handleHealthz(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	body, _ := json.Marshal(map[string]any{
+		"status":  "ok",
+		"server":  s.Name,
+		"version": s.Version,
+	})
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+// securityHeaders sets a small set of defensive response headers on every
+// reply. Cache-Control + X-Content-Type-Options are always emitted; HSTS is
+// only emitted when the server is actually listening on TLS, so we never
+// advertise a transport we cannot honor.
+func securityHeaders(tlsEnabled bool, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Cache-Control", "no-store")
+		h.Set("X-Content-Type-Options", "nosniff")
+		if tlsEnabled {
+			h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // authMiddleware enforces that every inbound request carries a valid
@@ -131,4 +205,67 @@ func rejectAuth(w http.ResponseWriter, r *http.Request, reason string) {
 		"reason", reason,
 	)
 	http.Error(w, "unauthorized", http.StatusUnauthorized)
+}
+
+// statusRecorder wraps http.ResponseWriter so requestLogger can read back the
+// final status code and signal whether the connection was hijacked (SSE
+// streams). It also forwards Flush/Hijack so the SSE server can still keep
+// long-lived connections open.
+type statusRecorder struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+	hijacked    bool
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	if !r.wroteHeader {
+		r.status = code
+		r.wroteHeader = true
+	}
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	if !r.wroteHeader {
+		r.status = http.StatusOK
+		r.wroteHeader = true
+	}
+	return r.ResponseWriter.Write(b)
+}
+
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, http.ErrNotSupported
+	}
+	r.hijacked = true
+	return h.Hijack()
+}
+
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// requestLogger logs one line per request after the handler returns. For SSE
+// streams (Hijack used) the latency reflects the full stream lifetime and the
+// log line is deferred until the connection closes — this is the cleanest
+// signal we can give an operator without spamming a line per chunk. The
+// X-DroidMCP-Key header is never read here, so the API key cannot leak.
+func requestLogger(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		logger.Log.Info("http",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", rec.status,
+			"latency_ms", time.Since(start).Milliseconds(),
+			"remote", r.RemoteAddr,
+			"hijacked", rec.hijacked,
+		)
+	})
 }
