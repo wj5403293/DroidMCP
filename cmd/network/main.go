@@ -187,7 +187,7 @@ func handleCheckPorts(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTo
 		out.Resolved = append(out.Resolved, ip.String())
 	}
 	for i, r := range results {
-		out.Ports[i] = portCheck{Port: r.Port, Open: r.Open}
+		out.Ports[i] = portCheck(r)
 	}
 	return jsonResult(out)
 }

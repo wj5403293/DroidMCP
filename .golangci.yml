@@ -15,14 +15,43 @@ linters:
     - unused
 
   settings:
+    errcheck:
+      # Project policy: deferred Close on read-only files, network connections
+      # and HTTP response bodies is best-effort -- we have no way to surface
+      # those errors and never depend on the side effect of the Close itself.
+      # io.Copy into io.Discard is the standard "drain the body" idiom for
+      # connection reuse and intentionally ignores the byte count.
+      exclude-functions:
+        - (io.Closer).Close
+        - (*os.File).Close
+        - (net.Conn).Close
+        - (*net.TCPConn).Close
+        - (io.ReadCloser).Close
+        - io.Copy
     gosec:
       excludes:
         # G104 (errors unhandled) is already covered by errcheck.
         - G104
+        # G115 (integer overflow on conversion) fires on `byte(n>>24)` style
+        # masks where the shift guarantees the value fits. Reviewed manually.
+        - G115
+        # G204 (subprocess with variable) is intrinsic to mcp-termux,
+        # mcp-network and mcp-clipboard: those tools expose command execution
+        # as a feature. Inputs are gated by DROIDMCP_TERMUX_ALLOWLIST and
+        # hardcoded wrapper names (termux-clipboard-*, ping, traceroute, ...).
+        - G204
+        # G301 (dir perms) / G306 (file perms) want 0750/0600. The filesystem
+        # MCP writes user-visible content, where 0755/0644 is the expected
+        # default for files the operator will later read or share.
+        - G301
+        - G306
         # G304 (file inclusion via variable) fires on every filepath.Join with
         # user-controlled input; we already gate filesystem access through
         # securePath, so the linter signal is dominated by false positives.
         - G304
+        # G404 (weak RNG) targets the retry jitter in mcp-github. The jitter
+        # is purely for spreading retries; it carries no security guarantee.
+        - G404
 
   exclusions:
     rules:

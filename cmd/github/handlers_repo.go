@@ -128,8 +128,8 @@ func registerRepoTools(s *core.DroidServer) {
 }
 
 func handleListRepos(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	opts := &github.RepositoryListOptions{ListOptions: paginationOpts(req)}
-	repos, resp, err := ghClient.Repositories.List(ctx, "", opts)
+	opts := &github.RepositoryListByAuthenticatedUserOptions{ListOptions: paginationOpts(req)}
+	repos, resp, err := ghClient.Repositories.ListByAuthenticatedUser(ctx, opts)
 	if err != nil {
 		return githubError(err)
 	}

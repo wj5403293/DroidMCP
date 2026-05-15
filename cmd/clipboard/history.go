@@ -82,8 +82,9 @@ func (h *clipboardHistory) Push(content []byte, source string) {
 	original := len(content)
 	stored := content
 	truncated := false
-	if int64(len(stored)) > maxStoredEntryBytes {
-		stored = append([]byte(nil), stored[:maxStoredEntryBytes]...)
+	limit := int(maxStoredEntryBytes)
+	if len(stored) > limit {
+		stored = append([]byte(nil), stored[:limit]...)
 		truncated = true
 	} else {
 		stored = append([]byte(nil), stored...)
