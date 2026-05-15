@@ -2,13 +2,70 @@ name: Build and Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -race -count=1 ./...
+
+  lint:
+    name: Lint (golangci-lint)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
+
+  gosec:
+    name: Security (gosec)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run gosec
+        uses: securego/gosec@master
+        with:
+          args: ./...
+
   build:
     name: Build ARM64 Binaries
+    needs: [test, lint, gosec]
     runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
     strategy:
       matrix:
         service: [filesystem, github, scraper, termux, network, clipboard]
@@ -20,36 +77,78 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.26'
+          cache: true
 
-      - name: Build binary
+      - name: Build reproducible binary
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: arm64
+          GOFLAGS: "-trimpath"
         run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o droidmcp-${{ matrix.service }} ./cmd/${{ matrix.service }}
+          go build \
+            -trimpath \
+            -ldflags="-s -w -buildid=" \
+            -o droidmcp-${{ matrix.service }} \
+            ./cmd/${{ matrix.service }}
+
+      - name: Generate per-binary SHA256
+        run: sha256sum droidmcp-${{ matrix.service }} > droidmcp-${{ matrix.service }}.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: droidmcp-${{ matrix.service }}
-          path: droidmcp-${{ matrix.service }}
+          path: |
+            droidmcp-${{ matrix.service }}
+            droidmcp-${{ matrix.service }}.sha256
 
   release:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
-      contents: write    
+      contents: write
+      id-token: write
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
+
+      - name: Flatten artifacts and build SHA256SUMS
+        run: |
+          mkdir -p release
+          for d in droidmcp-*; do
+            cp "$d"/* release/
+          done
+          cd release
+          sha256sum droidmcp-* > SHA256SUMS
+          rm -f *.sha256
+          ls -la
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign SHA256SUMS (keyless)
+        run: |
+          cosign sign-blob \
+            --yes \
+            --output-signature release/SHA256SUMS.sig \
+            --output-certificate release/SHA256SUMS.pem \
+            release/SHA256SUMS
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            droidmcp-filesystem/droidmcp-filesystem
-            droidmcp-github/droidmcp-github
-            droidmcp-scraper/droidmcp-scraper
-            droidmcp-termux/droidmcp-termux
-            droidmcp-network/droidmcp-network
-            droidmcp-clipboard/droidmcp-clipboard
+            release/droidmcp-filesystem
+            release/droidmcp-github
+            release/droidmcp-scraper
+            release/droidmcp-termux
+            release/droidmcp-network
+            release/droidmcp-clipboard
+            release/SHA256SUMS
+            release/SHA256SUMS.sig
+            release/SHA256SUMS.pem
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

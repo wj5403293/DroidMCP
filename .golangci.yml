@@ -1,0 +1,47 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - gosec
+    - ineffassign
+    - staticcheck
+    - unused
+
+  settings:
+    gosec:
+      excludes:
+        # G104 (errors unhandled) is already covered by errcheck.
+        - G104
+        # G304 (file inclusion via variable) fires on every filepath.Join with
+        # user-controlled input; we already gate filesystem access through
+        # securePath, so the linter signal is dominated by false positives.
+        - G304
+
+  exclusions:
+    rules:
+      # Tests may exercise error paths that intentionally ignore returns.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+      # Generated owner_*.go files are platform-shimmed and trivial.
+      - path: cmd/filesystem/owner_.*\.go
+        linters:
+          - unused
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+output:
+  formats:
+    text:
+      print-linter-name: true
+      print-issued-lines: true
