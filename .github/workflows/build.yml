@@ -56,10 +56,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
+      # Mirror the gosec excludes declared in .golangci.yml so the standalone
+      # binary applies the same policy as the lint job. Rationale for each
+      # rule lives in .golangci.yml (linters.settings.gosec.excludes).
       - name: Run gosec
         uses: securego/gosec@master
         with:
-          args: ./...
+          args: -exclude=G104,G115,G204,G301,G304,G306,G404 ./...
 
   build:
     name: Build ARM64 Binaries
