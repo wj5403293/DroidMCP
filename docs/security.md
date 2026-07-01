@@ -32,11 +32,11 @@ Mitigations the codebase currently implements:
 
 | Layer | Mitigation |
 |-------|------------|
-| Auth | Per-server / global API key checked with `crypto/subtle.ConstantTimeCompare`. |
+| Auth | Per-server / global API key checked with `crypto/subtle.ConstantTimeCompare`. `mcp-termux` and `mcp-filesystem` refuse to start without one. |
 | Transport | Optional TLS via `DROIDMCP_TLS_CERT` / `_KEY`; HSTS sent only when TLS is active. |
 | Headers | `Cache-Control: no-store` and `X-Content-Type-Options: nosniff` on every response. |
 | Logging | `slog`-based, with credential redaction in attribute keys (`api_key`, `token`, `password`, …). |
-| `mcp-filesystem` | `securePath` rejects absolute paths and traversal; everything resolves under `DROIDMCP_ROOT`. |
+| `mcp-filesystem` | Requires an explicit `DROIDMCP_ROOT` and an API key. `securePath` rejects absolute paths and `..` traversal, then resolves symlinks and re-checks so a symlink under the root cannot point outside it. |
 | `mcp-scraper` | Anti-SSRF: rejects RFC1918 / loopback / link-local by default (override with `DROIDMCP_SCRAPER_ALLOW_PRIVATE=1`). |
 | `mcp-network` | Refuses public targets by default (override with `DROIDMCP_NETWORK_ALLOW_PUBLIC=1`). |
 | `mcp-termux` | Optional allowlist via `DROIDMCP_TERMUX_ALLOWLIST=cmd1,cmd2,…`; `install_pkg` quotes the package name (`pkg install -- <name>`). |
@@ -44,10 +44,11 @@ Mitigations the codebase currently implements:
 
 Known gaps that operators should keep in mind (tracked in `AUDIT_REPORT.txt`):
 
-- `securePath` does not yet resolve symlinks (audit item 2.2). A
-  symlink already present under `DROIDMCP_ROOT` can point outside it.
-- The default `DROIDMCP_ROOT` is still `/` (audit item 2.3). Override
-  it explicitly in production.
+- `securePath` now resolves symlinks and re-checks containment (audit
+  item 2.2 closed), but the check is not fully TOCTOU-proof: a process
+  that can swap a symlink *inside the root* between the check and the
+  operation could still race it. Don't mount a root that other
+  untrusted processes can write to.
 - No rate limit yet (audit 2.7). Pair the server with a reverse proxy
   if you need one.
 
@@ -59,9 +60,11 @@ Every server enforces the same scheme:
    `config.ResolveAPIKey("<server-name>")` which checks, in order:
    - `DROIDMCP_<SERVER>_KEY` (e.g. `DROIDMCP_TERMUX_KEY`)
    - `DROIDMCP_API_KEY` (global fallback)
-2. If both are unset, the server starts in **dev mode** and logs
+2. If both are unset, most servers start in **dev mode** and log
    `auth=disabled`. Every request is accepted. Use this only on
-   loopback for local development.
+   loopback for local development. `mcp-termux` and `mcp-filesystem`
+   are the exceptions: they refuse to start without a key, because they
+   expose command execution and read/write filesystem access.
 3. If a key is set, every inbound request must carry it in the
    `X-DroidMCP-Key` HTTP header. The comparison is constant-time.
 4. `GET /healthz` is always served unauthenticated so external
@@ -148,11 +151,13 @@ The request logger never reads or logs the `X-DroidMCP-Key` header.
 
 ## Filesystem root
 
-`mcp-filesystem` confines all paths to `DROIDMCP_ROOT`. The shipped
-default is `/`, which is **insecure** — any client with the key (or
-any caller at all in dev mode) can read or overwrite system files.
+`mcp-filesystem` confines all paths to `DROIDMCP_ROOT`. It **requires
+`DROIDMCP_ROOT` to be set explicitly** and refuses to start otherwise —
+the shared config default of `/` is never used to grant access, so an
+unconfigured server cannot silently expose the whole device.
 
-Always set an explicit root in production:
+Set the root (and an API key — the server also refuses to start
+without one):
 
 ```bash
 # On Android / Termux:
@@ -160,13 +165,16 @@ export DROIDMCP_ROOT=/storage/emulated/0/DroidMCP
 
 # On a Linux box:
 export DROIDMCP_ROOT=/srv/droidmcp/workspace
+
+export DROIDMCP_FILESYSTEM_KEY="$(openssl rand -base64 32)"  # or DROIDMCP_API_KEY
 ```
 
-The directory must exist and be a directory; `LoadConfig` fail-fasts
-with a descriptive error otherwise (`DROIDMCP_ROOT "<path>": not a
-directory`). Symlinks that already live under `DROIDMCP_ROOT` and
-point elsewhere are not yet rewritten (audit item 2.2), so avoid
-mounting a root that contains untrusted symlinks.
+The directory must exist and be a directory; startup fail-fasts with a
+descriptive error otherwise (`DROIDMCP_ROOT "<path>": not a
+directory`). `securePath` resolves symlinks and re-verifies containment,
+so a symlink under the root pointing elsewhere is rejected rather than
+followed (audit item 2.2). The resolution is not fully TOCTOU-proof, so
+still avoid mounting a root other untrusted processes can write to.
 
 ## `mcp-clipboard` requirements
 
@@ -253,7 +261,8 @@ Before exposing any DroidMCP server beyond `localhost`:
       per-server key for every server you start).
 - [ ] `DROIDMCP_TLS_CERT` / `_KEY` configured if the listener is
       reachable from anything but loopback.
-- [ ] `DROIDMCP_ROOT` set to a dedicated directory — never `/`.
+- [ ] `DROIDMCP_ROOT` set to a dedicated directory (required by
+      `mcp-filesystem`, which won't start without it) — never `/`.
 - [ ] `DROIDMCP_LOG_FORMAT=json` and the logs shipped somewhere
       durable.
 - [ ] `DROIDMCP_TERMUX_ALLOWLIST` set if you actually need
@@ -265,6 +274,9 @@ Before exposing any DroidMCP server beyond `localhost`:
 - [ ] Binary verified against the published `SHA256SUMS` (and ideally
       the cosign `.sig`/`.pem` for the release tag).
 
-In dev mode (loopback only, no key, plain HTTP) the same servers are
-fine for experimentation — just understand the moment you bind to a
-non-loopback interface, you owe yourself the items above.
+In dev mode (loopback only, no key, plain HTTP) the scraper, network
+and clipboard servers are fine for experimentation — just understand
+the moment you bind to a non-loopback interface, you owe yourself the
+items above. `mcp-termux` and `mcp-filesystem` have no dev mode: both
+require a key (and filesystem also requires `DROIDMCP_ROOT`) even on
+loopback.

@@ -150,9 +150,12 @@ func TestHandleSetClipboardRejectsBoth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, isErr := resultText(t, res)
+	text, isErr := resultText(t, res)
 	if !isErr {
 		t.Fatal("expected error when both text and text_base64 supplied")
+	}
+	if !strings.Contains(text, "exactly one") {
+		t.Errorf("expected the mutual-exclusion error, got %q", text)
 	}
 }
 
@@ -162,9 +165,12 @@ func TestHandleSetClipboardRejectsNeither(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, isErr := resultText(t, res)
+	text, isErr := resultText(t, res)
 	if !isErr {
 		t.Fatal("expected error when neither text nor text_base64 supplied")
+	}
+	if !strings.Contains(text, "exactly one") {
+		t.Errorf("expected the mutual-exclusion error, got %q", text)
 	}
 }
 

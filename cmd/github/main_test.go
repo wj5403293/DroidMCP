@@ -99,17 +99,17 @@ func TestHandleGetRepoJSON(t *testing.T) {
 		w.Header().Set("X-RateLimit-Limit", "5000")
 		w.Header().Set("X-RateLimit-Remaining", "4999")
 		json.NewEncoder(w).Encode(map[string]any{
-			"name":           "hello",
-			"full_name":      "octo/hello",
-			"description":    "demo",
-			"html_url":       "https://github.com/octo/hello",
-			"default_branch": "main",
-			"private":        false,
-			"fork":           false,
-			"stargazers_count": 7,
-			"forks_count":      2,
+			"name":              "hello",
+			"full_name":         "octo/hello",
+			"description":       "demo",
+			"html_url":          "https://github.com/octo/hello",
+			"default_branch":    "main",
+			"private":           false,
+			"fork":              false,
+			"stargazers_count":  7,
+			"forks_count":       2,
 			"open_issues_count": 1,
-			"language":         "Go",
+			"language":          "Go",
 		})
 	})
 

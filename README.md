@@ -162,7 +162,7 @@ below is a quick reference.
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `DROIDMCP_PORT` | TCP port the SSE listener binds to | `3000` |
-| `DROIDMCP_ROOT` | Root for filesystem ops; also validated at startup | `/` **(insecure — override)** |
+| `DROIDMCP_ROOT` | Root for filesystem ops; validated at startup. **Required by `mcp-filesystem`** (it refuses to start without it). | `/` (used only by other servers, which ignore it) |
 | `DROIDMCP_API_KEY` | Global API key. If set, every request must carry it in `X-DroidMCP-Key` | unset (dev mode) |
 | `DROIDMCP_<SERVER>_KEY` | Per-server override, e.g. `DROIDMCP_TERMUX_KEY`. Wins over the global key. | unset |
 | `DROIDMCP_TLS_CERT` | Path to TLS certificate (PEM). If set together with `_KEY`, enables HTTPS + HSTS. | unset |
@@ -175,6 +175,7 @@ below is a quick reference.
 | Variable | Used by | Description |
 |----------|---------|-------------|
 | `GITHUB_TOKEN` / `GITHUB_APP_TOKEN` / `GITHUB_FINE_GRAINED_TOKEN` | `mcp-github` | Required. First one set is used. |
+| `DROIDMCP_MAX_READ_BYTES` | `mcp-filesystem` | Cap on bytes a single `read_file` buffers in memory (default 10 MiB). Page larger files with `offset`/`length`. |
 | `DROIDMCP_TERMUX_ALLOWLIST` | `mcp-termux` | Comma-separated allowlist for `run_command` (empty = allow all). |
 | `DROIDMCP_SCRAPER_ALLOW_PRIVATE` | `mcp-scraper` | Set to `1` to allow RFC1918/loopback URLs (off by default for SSRF safety). |
 | `DROIDMCP_NETWORK_ALLOW_PUBLIC` | `mcp-network` | Set to `1` to allow non-RFC1918 scan targets. |
@@ -184,7 +185,7 @@ below is a quick reference.
 ### Health and auth
 
 - `GET /healthz` always returns `200 {"status":"ok","server":<name>,"version":<v>}` and bypasses auth so a supervisor (systemd, Docker, k8s) can probe the server without holding the key.
-- Every other route requires the `X-DroidMCP-Key` header when `DROIDMCP_API_KEY` (or the per-server override) is set. Comparison is constant-time. With no key configured, the server logs `auth=disabled` and accepts every request — use this only on `localhost`.
+- Every other route requires the `X-DroidMCP-Key` header when `DROIDMCP_API_KEY` (or the per-server override) is set. Comparison is constant-time. With no key configured, most servers log `auth=disabled` and accept every request — use this only on `localhost`. `mcp-termux` and `mcp-filesystem` are exceptions: they refuse to start without a key.
 
 ---
 
@@ -196,7 +197,8 @@ Each server starts an HTTP/SSE endpoint. The SSE stream is available at `http://
 
 ```bash
 export DROIDMCP_PORT=3000
-export DROIDMCP_ROOT=/sdcard/Documents
+export DROIDMCP_ROOT=/sdcard/Documents          # required — server won't start without it
+export DROIDMCP_FILESYSTEM_KEY="$(openssl rand -base64 32)"  # required — or DROIDMCP_API_KEY
 droidmcp-filesystem
 ```
 
@@ -260,7 +262,8 @@ Health probes from a supervisor do not need the key:
 
 ```bash
 curl -fsS https://localhost:3000/healthz
-# {"status":"ok","server":"droidmcp-filesystem","version":"1.0.0"}
+# {"status":"ok","server":"mcp-filesystem","version":"dev"}
+# (version is "dev" for local builds; release binaries report the git tag)
 ```
 
 Clients pass the key in `X-DroidMCP-Key`:
@@ -363,21 +366,24 @@ DroidMCP/
 Read [`docs/security.md`](docs/security.md) for the full threat model and the
 production checklist. Highlights:
 
-- **Default `DROIDMCP_ROOT=/` is insecure.** Always override it to a dedicated
-  directory before exposing `mcp-filesystem` to any non-trivial client.
+- **`mcp-filesystem` requires an explicit `DROIDMCP_ROOT` and an API key.** It
+  refuses to start without both, so an unconfigured server can never fall back
+  to the insecure `/` default or run unauthenticated.
 - **Dev mode vs production.** With no `DROIDMCP_API_KEY` (and no per-server
-  key), every request is accepted and the startup banner logs `auth=disabled`.
-  That mode is meant for a single shell on `localhost`. Anywhere else, set a
-  random key and enable TLS via `DROIDMCP_TLS_CERT` / `DROIDMCP_TLS_KEY`.
+  key), most servers accept every request and the startup banner logs
+  `auth=disabled`. That mode is meant for a single shell on `localhost`.
+  Anywhere else, set a random key and enable TLS via `DROIDMCP_TLS_CERT` /
+  `DROIDMCP_TLS_KEY`. (`mcp-termux` and `mcp-filesystem` have no dev mode.)
 - **`mcp-termux` is a remote shell.** Restrict it with `DROIDMCP_TERMUX_ALLOWLIST`,
   give it a dedicated `DROIDMCP_TERMUX_KEY`, and do not start it at all if you do
   not need it.
 - **`mcp-clipboard` needs `termux-api`.** Install the Android app and run
   `pkg install termux-api` in Termux; otherwise tools return a clear hint and
   fail. See [`docs/setup-termux.md`](docs/setup-termux.md).
-- **`mcp-filesystem`** rejects absolute paths and `..` traversal. Symlink
-  resolution is not yet enforced (audit item 2.2) — avoid roots containing
-  untrusted symlinks.
+- **`mcp-filesystem`** rejects absolute paths and `..` traversal, then resolves
+  symlinks and re-checks containment so a symlink under the root cannot point
+  outside it (audit item 2.2 closed). The check isn't fully TOCTOU-proof, so
+  still avoid roots that other untrusted processes can write to.
 - **`mcp-scraper` / `mcp-network`** ship with safe defaults (no RFC1918 / no
   public targets respectively). Override only when you understand the SSRF /
   network-scan implications.

@@ -1,4 +1,4 @@
-.PHONY: build build-arm64 test vet lint sec checksums clean install
+.PHONY: build build-arm64 test vet fmt fmt-check lint sec checksums clean install
 
 # Reproducible-build flags shared by every target. -trimpath strips local
 # paths from the binary so a build on machine A and machine B with the same
@@ -6,11 +6,15 @@
 # tables; -buildid= clears the random link-time build ID so the result is
 # stable across rebuilds.
 GOFLAGS_REPRO   := -trimpath
-LDFLAGS_REPRO   := -s -w -buildid=
+# VERSION is stamped into internal/buildinfo.Version so /healthz and logs report
+# the real build. Defaults to the git tag/commit; overridable (e.g. VERSION=v1.2.3).
+# Builds from the same commit stamp the same value, preserving reproducibility.
+VERSION         ?= $(shell git describe --tags --always 2>/dev/null || echo dev)
+LDFLAGS_REPRO   := -s -w -buildid= -X github.com/kahz12/droidmcp/internal/buildinfo.Version=$(VERSION)
 SERVICES        := filesystem github scraper termux network clipboard
 
 build:
-	@echo "Building binaries (reproducible)..."
+	@echo "Building binaries (reproducible, version $(VERSION))..."
 	@mkdir -p bin
 	@for s in $(SERVICES); do \
 		go build $(GOFLAGS_REPRO) -ldflags="$(LDFLAGS_REPRO)" -o bin/droidmcp-$$s ./cmd/$$s; \
@@ -25,6 +29,17 @@ test:
 
 vet:
 	@go vet ./...
+
+fmt:
+	@gofmt -w .
+
+fmt-check:
+	@unformatted="$$(gofmt -l .)"; \
+	if [ -n "$$unformatted" ]; then \
+		echo "These files are not gofmt-clean; run 'make fmt':"; \
+		echo "$$unformatted"; \
+		exit 1; \
+	fi
 
 lint:
 	@command -v golangci-lint >/dev/null 2>&1 || { echo "golangci-lint not installed"; exit 1; }

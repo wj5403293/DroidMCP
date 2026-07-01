@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/go-github/v60/github"
+	"github.com/kahz12/droidmcp/internal/buildinfo"
 	"github.com/kahz12/droidmcp/internal/config"
 	"github.com/kahz12/droidmcp/internal/core"
 	"github.com/kahz12/droidmcp/internal/logger"
@@ -55,7 +56,7 @@ func main() {
 		logger.Fatal("GitHub token validation failed", err, "source", source)
 	}
 
-	server := core.NewDroidServer("mcp-github", "1.0.0")
+	server := core.NewDroidServer("mcp-github", buildinfo.Version)
 	server.APIKey = config.ResolveAPIKey("github")
 	registerTools(server)
 

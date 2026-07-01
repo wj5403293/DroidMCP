@@ -65,6 +65,12 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		if resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
 			return resp, nil
 		}
+		// This was the last attempt: return the response with its body intact
+		// so the caller (go-github's CheckResponse) can still read the error
+		// payload. Draining/closing it here would strip GitHub's error detail.
+		if attempt == retryMaxAttempts-1 {
+			return resp, nil
+		}
 		// Drain and close the body so the connection can be reused on retry.
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()

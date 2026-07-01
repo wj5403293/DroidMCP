@@ -67,6 +67,10 @@ func TestHandleScanNetworkPrivateAcceptsAndReturnsJSON(t *testing.T) {
 	if got.Subnet != "127.0.0.0/30" {
 		t.Errorf("subnet: %q", got.Subnet)
 	}
+	// Count must agree with the actual hosts slice, or the JSON contract lies.
+	if got.Count != len(got.Hosts) {
+		t.Errorf("count %d disagrees with hosts length %d", got.Count, len(got.Hosts))
+	}
 }
 
 func TestHandleCheckPortsRejectsPublic(t *testing.T) {

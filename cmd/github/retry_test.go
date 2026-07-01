@@ -89,6 +89,15 @@ func TestRetryTransportGivesUpAfterMaxAttempts(t *testing.T) {
 	if got := rt.calls.Load(); got != retryMaxAttempts {
 		t.Fatalf("expected exactly %d attempts, got %d", retryMaxAttempts, got)
 	}
+	// The body of the final response must still be readable: callers
+	// (go-github's CheckResponse) rely on it to surface GitHub's error detail.
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("final response body must be readable, got err: %v", err)
+	}
+	if string(body) != "body" {
+		t.Fatalf("expected intact body %q, got %q", "body", string(body))
+	}
 }
 
 func TestParseRetryAfterSeconds(t *testing.T) {

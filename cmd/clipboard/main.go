@@ -14,6 +14,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/kahz12/droidmcp/internal/buildinfo"
 	"github.com/kahz12/droidmcp/internal/config"
 	"github.com/kahz12/droidmcp/internal/core"
 	"github.com/kahz12/droidmcp/internal/logger"
@@ -29,7 +30,7 @@ func main() {
 		logger.Fatal("Failed to load config", err)
 	}
 
-	server := core.NewDroidServer("mcp-clipboard", "1.0.0")
+	server := core.NewDroidServer("mcp-clipboard", buildinfo.Version)
 	server.APIKey = config.ResolveAPIKey("clipboard")
 	registerTools(server)
 

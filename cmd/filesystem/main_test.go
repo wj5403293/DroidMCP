@@ -84,6 +84,42 @@ func TestSecurePath(t *testing.T) {
 	}
 }
 
+func TestSecurePathSymlinkEscape(t *testing.T) {
+	root := withRoot(t)
+
+	// A directory outside root, holding a file we must not be able to reach.
+	outside, err := os.MkdirTemp("", "mcp-fs-outside")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(outside) })
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// A symlink inside root pointing outside root must not be traversable,
+	// whether the leaf already exists or is about to be created.
+	if err := os.Symlink(outside, filepath.Join(root, "escape")); err != nil {
+		t.Skipf("symlinks unsupported in this environment: %v", err)
+	}
+	for _, rel := range []string{"escape", "escape/secret.txt", "escape/newfile.txt"} {
+		if _, err := securePath(rel); err == nil {
+			t.Errorf("securePath(%q) should be denied: symlink escapes root", rel)
+		}
+	}
+
+	// A symlink that stays inside root is still allowed.
+	if err := os.Mkdir(filepath.Join(root, "real"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "real"), filepath.Join(root, "inside")); err != nil {
+		t.Skipf("symlinks unsupported in this environment: %v", err)
+	}
+	if _, err := securePath("inside/ok.txt"); err != nil {
+		t.Errorf("securePath(inside/ok.txt) should be allowed (symlink stays in root): %v", err)
+	}
+}
+
 func TestReadFileOffsetLength(t *testing.T) {
 	root := withRoot(t)
 	if err := os.WriteFile(filepath.Join(root, "data.txt"), []byte("abcdefghij"), 0o644); err != nil {
@@ -120,6 +156,49 @@ func TestReadFileOffsetLength(t *testing.T) {
 			t.Fatalf("expected error, got success: %s", got)
 		}
 	})
+}
+
+func TestReadFileMaxBytes(t *testing.T) {
+	root := withRoot(t)
+	orig := maxReadBytes
+	maxReadBytes = 8
+	t.Cleanup(func() { maxReadBytes = orig })
+
+	if err := os.WriteFile(filepath.Join(root, "big.txt"), []byte("0123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unbounded read of a file over the cap is rejected.
+	got, isErr := resultText(t, mustCall(handleReadFile, map[string]any{"path": "big.txt"}))
+	if !isErr {
+		t.Fatalf("expected error for file over cap, got: %s", got)
+	}
+
+	// A bounded read within the cap still works.
+	got, isErr = resultText(t, mustCall(handleReadFile, map[string]any{"path": "big.txt", "length": 4}))
+	if isErr {
+		t.Fatalf("bounded read within cap should succeed: %s", got)
+	}
+	if got != "0123" {
+		t.Errorf("got %q, want %q", got, "0123")
+	}
+
+	// Requesting more than the cap in one call is rejected up front.
+	if _, isErr := resultText(t, mustCall(handleReadFile, map[string]any{"path": "big.txt", "length": 9})); !isErr {
+		t.Fatalf("expected error when requested length exceeds cap")
+	}
+
+	// A file exactly at the cap reads fine.
+	if err := os.WriteFile(filepath.Join(root, "exact.txt"), []byte("01234567"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, isErr = resultText(t, mustCall(handleReadFile, map[string]any{"path": "exact.txt"}))
+	if isErr {
+		t.Fatalf("file exactly at cap should read: %s", got)
+	}
+	if got != "01234567" {
+		t.Errorf("got %q, want %q", got, "01234567")
+	}
 }
 
 func TestReadFileLines(t *testing.T) {

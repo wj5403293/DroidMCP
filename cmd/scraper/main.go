@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	"github.com/kahz12/droidmcp/internal/buildinfo"
 	"github.com/kahz12/droidmcp/internal/config"
 	"github.com/kahz12/droidmcp/internal/core"
 	"github.com/kahz12/droidmcp/internal/logger"
@@ -28,7 +29,7 @@ func main() {
 		logger.Fatal("Failed to load config", err)
 	}
 
-	server := core.NewDroidServer("mcp-scraper", "1.0.0")
+	server := core.NewDroidServer("mcp-scraper", buildinfo.Version)
 	server.APIKey = config.ResolveAPIKey("scraper")
 	registerTools(server)
 
@@ -95,13 +96,13 @@ func registerTools(s *core.DroidServer) {
 // fetchResultJSON is the wire format for fetch_page (and the source of the
 // _meta block that the structured tools embed).
 type fetchResultJSON struct {
-	URL        string            `json:"url"`
-	Status     int               `json:"status"`
-	Headers    map[string]string `json:"headers,omitempty"`
-	Body       string            `json:"body"`
-	BodyBytes  int               `json:"body_bytes"`
-	FetchedAt  time.Time         `json:"fetched_at"`
-	FromCache  bool              `json:"from_cache"`
+	URL       string            `json:"url"`
+	Status    int               `json:"status"`
+	Headers   map[string]string `json:"headers,omitempty"`
+	Body      string            `json:"body"`
+	BodyBytes int               `json:"body_bytes"`
+	FetchedAt time.Time         `json:"fetched_at"`
+	FromCache bool              `json:"from_cache"`
 }
 
 type linksResult struct {

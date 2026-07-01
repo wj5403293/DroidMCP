@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kahz12/droidmcp/internal/buildinfo"
 	"github.com/kahz12/droidmcp/internal/config"
 	"github.com/kahz12/droidmcp/internal/core"
 	"github.com/kahz12/droidmcp/internal/logger"
@@ -32,7 +33,7 @@ func main() {
 		logger.Fatal("Failed to load config", err)
 	}
 
-	server := core.NewDroidServer("mcp-network", "1.0.0")
+	server := core.NewDroidServer("mcp-network", buildinfo.Version)
 	server.APIKey = config.ResolveAPIKey("network")
 	registerTools(server)
 
@@ -83,11 +84,11 @@ func registerTools(s *core.DroidServer) {
 
 // scanResult is the wire shape for scan_network.
 type scanResult struct {
-	Subnet  string        `json:"subnet"`
-	Count   int           `json:"count"`
-	Hosts   []scannedHost `json:"hosts"`
-	Capped  bool          `json:"capped,omitempty"`
-	Note    string        `json:"note,omitempty"`
+	Subnet string        `json:"subnet"`
+	Count  int           `json:"count"`
+	Hosts  []scannedHost `json:"hosts"`
+	Capped bool          `json:"capped,omitempty"`
+	Note   string        `json:"note,omitempty"`
 }
 
 func handleScanNetwork(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -148,6 +149,11 @@ func handleCheckPorts(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTo
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	// Dial the address we actually validated instead of re-resolving the
+	// hostname at dial time. Re-resolution would reopen a DNS-rebinding hole:
+	// a name that validated as private could rebind to a public IP before the
+	// TCP dial. validateTarget guarantees resolved is non-empty on success.
+	dialHost := resolved[0].String()
 
 	portsRaw := req.GetString("ports", defaultCheckPorts)
 	ports, err := parsePorts(portsRaw)
@@ -173,7 +179,7 @@ func handleCheckPorts(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTo
 		go func(i, p int) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			conn, err := dialer.DialContext(cctx, "tcp", net.JoinHostPort(host, strconv.Itoa(p)))
+			conn, err := dialer.DialContext(cctx, "tcp", net.JoinHostPort(dialHost, strconv.Itoa(p)))
 			results[i] = portResult{Port: p, Open: err == nil}
 			if conn != nil {
 				conn.Close()
@@ -256,7 +262,8 @@ func handleTraceroute(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTo
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	if _, err := validateTarget(host); err != nil {
+	resolved, err := validateTarget(host)
+	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	maxHops := req.GetInt("max_hops", 30)
@@ -267,7 +274,10 @@ func handleTraceroute(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTo
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	tool, args, err := chooseTracerouteTool(host, maxHops)
+	// Trace the validated IP rather than letting the external tool re-resolve
+	// the hostname, which would bypass the private-target policy via DNS
+	// rebinding. validateTarget guarantees resolved is non-empty on success.
+	tool, args, err := chooseTracerouteTool(resolved[0].String(), maxHops)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}

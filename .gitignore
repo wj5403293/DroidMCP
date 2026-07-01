@@ -17,6 +17,3 @@ vendor/
 
 # OS
 .DS_Store
-
-# Audit reports
-AUDIT_REPORT.txt

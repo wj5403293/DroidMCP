@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kahz12/droidmcp/internal/buildinfo"
 	"github.com/kahz12/droidmcp/internal/config"
 	"github.com/kahz12/droidmcp/internal/core"
 	"github.com/kahz12/droidmcp/internal/logger"
@@ -23,6 +24,16 @@ import (
 )
 
 var cfg *config.Config
+
+// defaultMaxReadBytes bounds how many bytes a single read_file call buffers in
+// memory, so a huge file cannot OOM the process. Callers can page past it with
+// offset/length.
+const defaultMaxReadBytes = 10 * 1024 * 1024 // 10 MiB
+
+// maxReadBytes is the active read cap. It is a package var (set once in main
+// from DROIDMCP_MAX_READ_BYTES) rather than read per-call, so handlers never
+// touch the viper instance — tests construct Config without one.
+var maxReadBytes int64 = defaultMaxReadBytes
 
 // fileEntry is the JSON shape returned by list_directory and stat. Pointer
 // fields are nil on platforms (e.g. Windows) where the underlying syscall.Stat_t
@@ -45,8 +56,32 @@ func main() {
 		logger.Fatal("Failed to load config", err)
 	}
 
-	server := core.NewDroidServer("mcp-filesystem", "1.0.0")
-	server.APIKey = config.ResolveAPIKey("filesystem")
+	// Require an explicit DROIDMCP_ROOT. The shared config defaults ROOT to
+	// "/", which would expose the entire device; the filesystem server is the
+	// only one that acts on ROOT, so it fail-fasts here rather than silently
+	// granting whole-filesystem access.
+	if !cfg.IsSet("ROOT") {
+		logger.Log.Error("mcp-filesystem requires DROIDMCP_ROOT to be set to the directory it may access. Refusing to start (the default of \"/\" would expose the whole device).")
+		os.Exit(1)
+	}
+
+	// This server grants read/write/delete over ROOT, so it must not run
+	// unauthenticated: anything else on localhost (other apps, adb) could
+	// otherwise drive it. Require an API key, mirroring mcp-termux.
+	apiKey := config.ResolveAPIKey("filesystem")
+	if apiKey == "" {
+		logger.Log.Error("mcp-filesystem requires DROIDMCP_FILESYSTEM_KEY or DROIDMCP_API_KEY to be set. Refusing to start.")
+		os.Exit(1)
+	}
+
+	// Optional override of the read cap (DROIDMCP_MAX_READ_BYTES). Non-positive
+	// or unset leaves the default in place.
+	if n := cfg.GetInt("MAX_READ_BYTES"); n > 0 {
+		maxReadBytes = int64(n)
+	}
+
+	server := core.NewDroidServer("mcp-filesystem", buildinfo.Version)
+	server.APIKey = apiKey
 	registerTools(server)
 
 	if err := server.ServeSSE(cfg.Port); err != nil {
@@ -149,12 +184,58 @@ func securePath(relPath string) (string, error) {
 		return "", err
 	}
 
-	// Security check: ensure target path is exactly absRoot or a descendant of it.
-	// Using absRoot+separator prevents prefix false positives (e.g., /tmp/safe vs /tmp/safevil).
-	if absTarget != absRoot && !strings.HasPrefix(absTarget, absRoot+string(filepath.Separator)) {
+	// First line of defense: a cheap lexical check that the cleaned target is
+	// absRoot or a descendant. Using absRoot+separator prevents prefix false
+	// positives (e.g., /tmp/safe vs /tmp/safevil).
+	if !withinRoot(absRoot, absTarget) {
 		return "", fmt.Errorf("access denied: path escapes root")
 	}
+
+	// Second line of defense: resolve symlinks along the path and confirm the
+	// real location is still inside the real root. A lexical check alone can be
+	// defeated by a symlink that lives inside root but points outside it
+	// (closes audit item 2.2).
+	if err := checkNoSymlinkEscape(absRoot, absTarget); err != nil {
+		return "", err
+	}
 	return absTarget, nil
+}
+
+// withinRoot reports whether absTarget is root itself or a descendant of it.
+func withinRoot(root, absTarget string) bool {
+	return absTarget == root || strings.HasPrefix(absTarget, root+string(filepath.Separator))
+}
+
+// checkNoSymlinkEscape resolves symlinks in absTarget (and in every parent
+// component) and verifies the real path stays within the real root. absTarget
+// need not exist yet: the longest existing ancestor is resolved and checked,
+// and the not-yet-created remainder cannot itself contain a symlink. Any
+// resolution error other than "does not exist" fails closed.
+func checkNoSymlinkEscape(absRoot, absTarget string) error {
+	realRoot, err := filepath.EvalSymlinks(absRoot)
+	if err != nil {
+		return fmt.Errorf("cannot resolve root: %w", err)
+	}
+	cur := absTarget
+	for {
+		resolved, err := filepath.EvalSymlinks(cur)
+		if err == nil {
+			if !withinRoot(realRoot, resolved) {
+				return fmt.Errorf("access denied: path escapes root via symlink")
+			}
+			return nil
+		}
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("access denied: %w", err)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			// Walked past the filesystem root without an existing ancestor.
+			// realRoot exists, so this is unreachable in practice; fail closed.
+			return fmt.Errorf("access denied: path escapes root")
+		}
+		cur = parent
+	}
 }
 
 // buildFileEntry converts an os.FileInfo into the JSON-friendly fileEntry shape.
@@ -204,14 +285,11 @@ func handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTool
 	if offset < 0 || length < 0 {
 		return mcp.NewToolResultError("offset and length must be non-negative"), nil
 	}
-
-	// Fast path: full read with no offset/length is an os.ReadFile.
-	if offset == 0 && length == 0 {
-		content, err := os.ReadFile(fullPath)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		return mcp.NewToolResultText(string(content)), nil
+	// Reject an explicit range larger than the cap up front so the caller
+	// knows to page rather than getting a silently truncated result.
+	if length > 0 && int64(length) > maxReadBytes {
+		return mcp.NewToolResultError(fmt.Sprintf(
+			"length %d exceeds max read size of %d bytes; read in smaller ranges", length, maxReadBytes)), nil
 	}
 
 	f, err := os.Open(fullPath)
@@ -224,13 +302,26 @@ func handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTool
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 	}
-	var reader io.Reader = f
+
+	// Explicit range: honor it exactly (already checked <= cap). Fewer bytes
+	// near EOF is fine.
 	if length > 0 {
-		reader = io.LimitReader(f, int64(length))
+		content, err := io.ReadAll(io.LimitReader(f, int64(length)))
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		return mcp.NewToolResultText(string(content)), nil
 	}
-	content, err := io.ReadAll(reader)
+
+	// Unbounded read: cap memory at maxReadBytes. Read one extra byte so we can
+	// tell "exactly at the cap" from "over the cap" and refuse the latter.
+	content, err := io.ReadAll(io.LimitReader(f, maxReadBytes+1))
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if int64(len(content)) > maxReadBytes {
+		return mcp.NewToolResultError(fmt.Sprintf(
+			"file exceeds max read size of %d bytes; use offset/length to read it in ranges", maxReadBytes)), nil
 	}
 	return mcp.NewToolResultText(string(content)), nil
 }

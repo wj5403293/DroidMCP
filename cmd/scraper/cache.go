@@ -19,12 +19,12 @@ const (
 // trip on the next call: the bytes, the status code, the response headers,
 // and the final URL after redirects.
 type cachedResponse struct {
-	URL        string
-	Status     int
-	Header     map[string][]string
-	Body       []byte
-	FetchedAt  time.Time
-	FromCache  bool
+	URL       string
+	Status    int
+	Header    map[string][]string
+	Body      []byte
+	FetchedAt time.Time
+	FromCache bool
 }
 
 type lruEntry struct {

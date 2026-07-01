@@ -104,7 +104,7 @@ Verify it is alive from another shell:
 
 ```bash
 curl -fsS http://localhost:3000/healthz
-# {"status":"ok","server":"droidmcp-filesystem","version":"1.0.0"}
+# {"status":"ok","server":"mcp-filesystem","version":"dev"}
 ```
 
 (Health probes bypass auth by design — see [`security.md`](security.md).)

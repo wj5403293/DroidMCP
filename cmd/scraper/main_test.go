@@ -267,6 +267,12 @@ func TestSSRFBlocksHandler(t *testing.T) {
 	if !isErr {
 		t.Fatalf("expected SSRF block, got success: %s", text)
 	}
+	// Assert it failed *because of the SSRF policy* and not some unrelated
+	// error (e.g. a connection refused that would slip through if the guard
+	// were removed). errBlockedHost formats as "...non-public address...".
+	if !strings.Contains(text, "non-public") {
+		t.Errorf("expected the host-policy block reason, got %q", text)
+	}
 }
 
 func TestStringMapArg(t *testing.T) {

@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/kahz12/droidmcp/internal/buildinfo"
 	"github.com/kahz12/droidmcp/internal/config"
 	"github.com/kahz12/droidmcp/internal/core"
 	"github.com/kahz12/droidmcp/internal/logger"
@@ -35,7 +36,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	server := core.NewDroidServer("mcp-termux", "1.0.0")
+	server := core.NewDroidServer("mcp-termux", buildinfo.Version)
 	server.APIKey = apiKey
 	registerTools(server)
 
